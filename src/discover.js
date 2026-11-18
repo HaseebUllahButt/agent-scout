@@ -287,3 +287,46 @@ function resolve(name, symbols, depth = 0, seen = new Set()) {
   };
 }
 
+// ------------------------------------------------------------ wrapper scripts
+
+/**
+ * The CLI a wrapper script launches, or null. People keep extra accounts
+ * behind scripts as well as aliases - `a1='agy-profile 1'`, where agy-profile
+ * points HOME at ~/.config/google-cli-profiles/agy-1 and then `exec`s agy.
+ * Nothing about that is visible from the alias, so read the script: when it
+ * ends by exec-ing a CLI's binary, the alias is an account of that CLI,
+ * run through the script. Variables the script assigns are substituted so
+ * `exec "$agy_bin" "$@"` still names agy.
+ */
+export function wrappedEngine(path) {
+  let text;
+  try {
+    if (!statSync(path).isFile() || statSync(path).size > 64 << 10) return null;
+    text = readFileSync(path, 'utf8');
+  } catch {
+    return null;
+  }
+  if (!text.startsWith('#!')) return null;
+
+  const vars = { HOME };
+  const sub = (s) => s.replace(/\$\{?([A-Za-z_][A-Za-z0-9_]*)(?::?[-=?][^}]*)?\}?/g, (m, name) => vars[name] ?? m);
+  let engine = null;
+  for (const raw of text.split('\n')) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const assign = /^(?:export\s+|local\s+|readonly\s+|declare\s+(?:-\w+\s+)?)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(line);
+    if (assign) {
+      const value = tokenize(assign[2])[0];
+      if (value !== undefined) vars[assign[1]] = sub(value);
+      continue;
+    }
+    const run = /^exec\s+(.*)$/.exec(line);
+    if (!run) continue;
+    let argv = splitAssignments(tokenize(run[1])).argv;
+    // `exec env VAR=x agy` runs agy just the same.
+    if (argv[0] === 'env') argv = splitAssignments(argv.slice(1).filter((t) => !t.startsWith('-'))).argv;
+    if (argv.length) engine = engineForCommand(sub(argv[0])) ?? engine;
+  }
+  return engine;
+}
+
