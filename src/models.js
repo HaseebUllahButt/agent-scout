@@ -1254,3 +1254,106 @@ async function piModels(engine, root, environment = {}, bin = engine) {
  * --format json shape is `[{"id","name",...}]`). Behind `agent login` - an
  * unauthenticated box simply offers nothing until it signs in.
  */
+async function cursorModels(environment = {}, bin = null) {
+  const bins = [bin ?? ENGINES.cursor?.bin ?? 'cursor-agent', 'agent'];
+  let stdout = null;
+  for (const b of bins) {
+    for (const args of [['models', '--format', 'json'], ['models'], ['--list-models']]) {
+      try {
+        ({ stdout } = await exec(b, args, { timeout: 20_000, env: { ...process.env, ...environment } }));
+        if (stdout?.trim()) break;
+      } catch { stdout = null; }
+    }
+    if (stdout?.trim()) break;
+  }
+  const models = [];
+  const labels = {};
+  const trimmed = (stdout ?? '').trim();
+  if (trimmed.startsWith('[') || trimmed.startsWith('{')) {
+    try {
+      const rows = JSON.parse(trimmed);
+      for (const r of Array.isArray(rows) ? rows : rows?.models ?? []) {
+        const id = typeof r === 'string' ? r : r?.id ?? r?.model ?? r?.slug;
+        if (id && !models.includes(id)) {
+          models.push(id);
+          const label = typeof r === 'object' && (r?.name ?? r?.displayName ?? r?.display_name);
+          if (label) labels[id] = label;
+        }
+      }
+    } catch { /* fall through to line parsing */ }
+  }
+  if (!models.length) {
+    for (const line of trimmed.split('\n')) {
+      const id = line.trim().replace(/^[*\-\s]+/, '').replace(/\s+\(default\)$/i, '');
+      if (id && !/^(available|default|error|usage)/i.test(id) && !models.includes(id)) models.push(id);
+    }
+  }
+  return { default: null, models, labels, images: true, source: 'cursor-agent models' };
+}
+
+/** gemini has no listing command; the public catalog is the only honest list. */
+async function geminiModels(net) {
+  const published = await modelsDevProvider('google', net);
+  const models = newestFirst(published.models.filter((m) => m.startsWith('gemini')), published.releasedAt);
+  return {
+    default: null, models, labels: published.labels, imagesByModel: published.imagesByModel, images: true,
+    releasedAt: published.releasedAt, source: 'models.dev',
+  };
+}
+
+/**
+ * `agy models` prints `slug<TAB>Display Name` rows. settings.json remembers
+ * the default by its *display name*, not the slug - resolve it back through
+ * the labels the list just printed. customModels entries are already slugs.
+ * An ineligible account gets an empty list; the rows still print on one that
+ * is merely signed out.
+ */
+async function agyModels(root, environment = {}, launcher = null, bin = 'agy') {
+  let stdout = '';
+  try {
+    const cmd = launcher ? expand(launcher.cmd) : bin;
+    ({ stdout } = await exec(cmd, [...(launcher?.args ?? []), 'models'], {
+      timeout: 20_000, env: { ...process.env, ...environment },
+    }));
+  } catch { /* `agy models` may still work unauthenticated; if not, empty */ }
+  return agyModelsFromOutput(root, stdout);
+}
+
+/**
+ * `agy models` prints `slug<TAB>Display Name` rows; `root` is the gemini home,
+ * whose settings.json remembers the default by display name.
+ */
+export function agyModelsFromOutput(root, stdout) {
+  // `root` is the gemini home; agy's own store sits under it.
+  const home = join(root, 'antigravity-cli');
+  const models = [];
+  const labels = {};
+  let defLabel = null;
+  try {
+    const cfg = JSON.parse(readFileSync(join(home, 'settings.json'), 'utf8'));
+    if (typeof cfg.model === 'string') defLabel = cfg.model;
+    for (const m of cfg.customModels ?? []) {
+      if (m?.modelName && !models.includes(m.modelName)) models.push(m.modelName);
+      if (m?.modelName && m?.displayName) labels[m.modelName] = m.displayName;
+    }
+  } catch { /* no settings */ }
+  for (const line of String(stdout ?? '').split('\n')) {
+    const row = line.trim();
+    if (!row) continue;
+    // `id\tLabel` - the label itself contains spaces, so only the first
+    // column break separates them.
+    const m = /^(\S+)(?:\t+|\s{2,})(.+)$/.exec(row);
+    const id = m?.[1] ?? row;
+    const label = m?.[2]?.trim();
+    if (/^(available|default|error|usage|eligibility|fetching)/i.test(id)) continue;
+    if (!models.includes(id)) models.push(id);
+    if (label) labels[id] ??= label;
+  }
+  let def = null;
+  if (defLabel) def = Object.keys(labels).find((id) => labels[id] === defLabel) ?? null;
+  if (def && !models.includes(def)) models.unshift(def);
+  // --effort takes low|medium|high|max.
+  return { default: def, models, labels, effort: null, efforts: ['low', 'medium', 'high', 'max'], images: true, source: 'agy models' };
+}
+
+/** `kimi provider list --json` lists the configured providers' models. */
