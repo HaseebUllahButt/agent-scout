@@ -138,3 +138,153 @@ function setCache(key, row) {
   if (row.dir) saveDisk(row.dir);
 }
 
+// ---------------------------------------------------------------- the cache
+
+function pendingRefreshes(engine, key) {
+  return [inflight.get(key), publicRefreshes.get(key),
+    ...(engine === 'codex' ? [codexRefreshes.get(key), codexManifestInflight] : []),
+    ...(['claude', 'gemini'].includes(engine) ? [modelsDevInflight] : []),
+    ...(engine === 'claude' ? [anthropicInflight] : []),
+  ].filter(Boolean);
+}
+
+/**
+ * The model catalog of one CLI account, in Helm's catalog shape:
+ * { default, models: [ids], labels, effort, efforts, effortsByModel, ...,
+ *   source, refreshing }.
+ *
+ * options
+ *   home      the account home (default: the CLI's env variable or default)
+ *   env       extra environment for the CLI (merged over process.env)
+ *   bin       the program to run (default: the CLI's name, found on PATH)
+ *   launcher  {cmd, args} of an account run through a wrapper script
+ *             (discover.js wrappedEngine): its own binary can only be
+ *             reached that way
+ *   settled   wait for refreshes already running before answering
+ *   refresh   ignore a cached answer's age (it is still the fallback)
+ *   cache     false keeps the answer out of the state folder
+ *   stateDir, offline, fetch
+ */
+export async function modelCatalog(engine, options = {}) {
+  const { home = null, env: environment = {}, launcher = null, settled = false, refresh = false } = options;
+  const dir = options.cache === false ? null : stateDir(options);
+  loadDisk(dir);
+  loadPublic(dir);
+  const key = modelsKey(engine, home, launcher);
+  if (settled) await modelsSettled(engine, home, launcher);
+  const answer = (value) => ({ ...value, refreshing: pendingRefreshes(engine, key).length > 0 });
+  const hit = cache.get(key);
+  if (hit && !refresh && Date.now() - hit.at < CACHE_MS) return answer(hit.value);
+  // Some CLIs take seconds to list (agy asks the server every time). A list
+  // that has aged out is still a far better answer than a spinner: hand it
+  // back and fetch the new one behind it.
+  const ctx = { engine, home, environment, launcher, bin: options.bin ?? null, net: network(options), dir };
+  if (hit?.value) {
+    refreshModels(key, ctx, hit).catch(() => {});
+    return answer(hit.value);
+  }
+  return answer(await refreshModels(key, ctx, hit));
+}
+
+const modelsKey = (engine, home, launcher) => {
+  const root = expand(home ?? ENGINES[engine]?.defaultHome ?? '~');
+  return `${engine}|${root}|${launcher ? [launcher.cmd, ...launcher.args].join(' ') : ''}`;
+};
+
+/** The held answer for an account, if there is one - never spawns anything. */
+export function peekModels(engine, home, launcher = null) {
+  return cache.get(modelsKey(engine, home, launcher))?.value ?? null;
+}
+
+/** The last error a refresh of this account hit, if it ended with nothing. */
+export function modelsError(engine, home, launcher = null) {
+  return lastErrors.get(modelsKey(engine, home, launcher)) ?? null;
+}
+
+/** Fill the cache from output something else already fetched (signin.js). */
+export function primeModels(engine, home, launcher, value, options = {}) {
+  const dir = options.cache === false ? null : stateDir(options);
+  setCache(modelsKey(engine, home, launcher), { at: Date.now(), value, dir });
+}
+
+const inflight = new Map();
+
+/** A session's live choices must never overwrite another session's cached catalog. */
+export function mergeLiveModelCatalog(catalog, live, { all = false } = {}) {
+  const models = { ...catalog };
+  let extra = [];
+  if (!live) return { models, extra };
+  if (live.models?.length) {
+    const advertised = new Set(live.models);
+    extra = all ? [] : models.models.filter((m) => !advertised.has(m));
+    models.models = all ? [...new Set([...live.models, ...models.models])] : [...live.models];
+  }
+  models.labels = { ...(models.labels ?? {}), ...(live.labels ?? {}) };
+  // These levels belong to the current model only. In particular, [] is
+  // authoritative: switching to a model without thinking removes the chip.
+  models.effortsByModel = { ...(models.effortsByModel ?? {}) };
+  if (live.current) models.effortsByModel[live.current] = [...(live.efforts ?? [])];
+  models.effort = live.effort ?? null;
+  models.efforts = [];
+  if (live.current && !models.default) models.default = live.current;
+  return { models, extra };
+}
+
+function refreshModels(key, ctx, hit) {
+  if (inflight.has(key)) return inflight.get(key);
+  discoveries.set(key, ctx);
+  const { engine, home, environment, launcher, net } = ctx;
+  const root = expand(home ?? ENGINES[engine]?.defaultHome ?? '~');
+  const bin = ctx.bin ?? ENGINES[engine]?.bin ?? engine;
+  const job = (async () => {
+    let value = { default: null, models: [] };
+    try {
+      if (engine === 'codex') value = await codexModels(root, environment, key, bin, net, ctx.dir);
+      else if (engine === 'claude') value = await claudeModels(root, environment, net);
+      else if (engine === 'opencode' || engine === 'opencode2') value = await opencodeModels(root, bin, environment, net);
+      else if (engine === 'devin') value = await devinModels(root, environment, bin);
+      else if (engine === 'grok') value = await grokModels(root, environment, bin);
+      else if (engine === 'pi' || engine === 'omp') value = await piModels(engine, root, environment, bin);
+      else if (engine === 'cursor') value = await cursorModels(environment, ctx.bin);
+      else if (engine === 'gemini') value = await geminiModels(net);
+      else if (engine === 'antigravity') value = await agyModels(root, environment, launcher, bin);
+      else if (engine === 'kimi') value = await kimiModels(environment, bin);
+      lastErrors.delete(key);
+    } catch (err) {
+      lastErrors.set(key, String(err?.message || err).split('\n')[0].slice(0, 300));
+      // A transient provider or CLI failure should not make a previously known
+      // model disappear from the list. The next expiry will try discovery
+      // again, while this answer keeps the caller useful in the meantime.
+      if (hit?.value) value = hit.value;
+    }
+    // An empty answer from a CLI that listed models before is a hiccup, not news.
+    if (!value.models?.length && hit?.value?.models?.length) value = hit.value;
+    setCache(key, { at: Date.now(), value, dir: ctx.dir });
+    return value;
+  })().finally(() => inflight.delete(key));
+  inflight.set(key, job);
+  return job;
+}
+
+/** Rebuild already-listed account caches after an optional public catalog updates. */
+function refreshDiscoveredModels(engines) {
+  for (const [key, discovery] of discoveries) {
+    if (!engines.has(discovery.engine) || publicRefreshes.has(key)) continue;
+    // Track this work before the public fetch ends. A waiting caller must not
+    // receive the old account cache between the fetch and its rebuild.
+    const job = (async () => {
+      // Wait for every public list, so the rebuild never runs with one of
+      // them half fetched and then gets skipped when it lands.
+      const lists = [modelsDevInflight, discovery.engine === 'claude' ? anthropicInflight : null];
+      await Promise.allSettled(lists.filter(Boolean));
+      const current = inflight.get(key);
+      if (current) await current.catch(() => {});
+      const hit = cache.get(key);
+      try {
+        await refreshModels(key, discovery, hit);
+      } catch { /* keep the prior account-specific answer */ }
+    })().finally(() => publicRefreshes.delete(key));
+    publicRefreshes.set(key, job);
+  }
+}
+
