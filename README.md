@@ -21,3 +21,16 @@ agent-scout was extracted from Helm,
 where this code finds the agents a phone can start and fills their model
 pickers. The Helm-only parts (accounts storage, sessions, terminals,
 delegation, the phone app) are left out.
+
+## Install
+
+```sh
+npm i github:HaseebUllahButt/agent-scout
+```
+
+or
+
+```sh
+git clone https://github.com/HaseebUllahButt/agent-scout
+node agent-scout/bin/agent-scout.js scan
+```
