@@ -1457,3 +1457,56 @@ async function devinModels(root, environment = {}, bin = 'devin') {
   };
 }
 
+// ---------------------------------------------------------------- arguments
+
+/**
+ * Turn the choices a person made (model, effort, "don't stop to ask") into
+ * the CLI's own arguments. Each CLI spells "just do it" differently; nobody
+ * should have to remember.
+ */
+export function optionArgs(engine, { model, auto, effort } = {}) {
+  const args = [];
+  if (engine === 'claude') {
+    if (model) args.push('--model', model);
+    if (auto) args.push('--permission-mode', 'auto');
+  } else if (engine === 'codex') {
+    if (model) args.push('-m', model);
+    if (effort) args.push('-c', `model_reasoning_effort="${effort}"`);
+    if (auto) args.push('--yolo');
+  } else if (engine === 'opencode' || engine === 'opencode2') {
+    if (model) args.push('-m', model);
+    if (auto) args.push('--auto');
+  } else if (engine === 'grok') {
+    if (model) args.push('-m', model);
+    if (effort) args.push('--reasoning-effort', effort);
+    if (auto) args.push('--permission-mode', 'auto');
+  } else if (engine === 'cursor') {
+    if (model) args.push('--model', model);
+    if (auto) args.push('--force');
+  } else if (engine === 'gemini') {
+    if (model) args.push('-m', model);
+    if (auto) args.push('--yolo');
+  } else if (engine === 'antigravity') {
+    if (model) args.push('--model', model);
+    if (effort) args.push('--effort', effort);
+    if (auto) args.push('--dangerously-skip-permissions');
+  } else if (engine === 'muse') {
+    // muse has no model picker flag verified; --yolo is its "don't stop" switch.
+    if (auto) args.push('--yolo');
+  }
+  return args;
+}
+
+/** Tests only: forget every in-memory answer and public catalog. */
+export function _resetModels() {
+  cache.clear();
+  loadedDirs.clear();
+  publicLoaded.clear();
+  publicDir = null;
+  discoveries.clear();
+  codexRetryAt.clear();
+  lastErrors.clear();
+  codexManifestCache = { at: 0, checkedAt: 0, models: [] };
+  modelsDevCache = { at: 0, checkedAt: 0, catalog: null };
+  anthropicCache = { at: 0, checkedAt: 0, page: null };
+}
