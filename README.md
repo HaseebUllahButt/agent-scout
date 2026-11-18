@@ -174,3 +174,30 @@ check `AGENT_SCOUT_DISCOVERY=1` to skip anything slow during this look.
 The Antigravity ACP agent has no PATH binary. It counts as installed when an
 unpacked runtime is in `~/.helm/tools/antigravity-acp/current` (override with
 `antigravityAcpDir` or `AGENT_SCOUT_ANTIGRAVITY_ACP_DIR`).
+
+## How model lists stay fresh
+
+- A list is kept for 10 minutes, in memory and in the state folder. An older
+  list is handed back at once while a new one is fetched behind it; `scan`,
+  `listModels` and the command line wait for that new one by default.
+- A CLI that fails, times out, or suddenly lists nothing never empties a list
+  it gave before: the last good list is kept.
+- Codex: the account's model cache on disk answers first, then
+  `codex debug models` (it refreshes Codex's own online catalog), then
+  `codex app-server`. A public manifest adds models Codex has published but
+  an older CLI does not list yet.
+- Claude Code has no model-list command. Its list is its own config (the
+  default and models used per project) plus models.dev plus Anthropic's
+  model page, which shows a new model on launch day. Newest first, with dated
+  snapshots last. Aliases like `opus` in `settings.json` are resolved to the
+  model they run.
+- opencode: `opencode models` reads the local catalog; `--refresh` is only
+  used when that is empty. OpenCode 2 is run with `--standalone`, so asking
+  does not leave its background service running. Effort levels come from
+  opencode's own models cache.
+- Public catalogs are fetched with a 5 second timeout and retried at most
+  every 30 seconds. The last good copy is kept in the state folder, so a run
+  that cannot reach them still lists what they said.
+- `scan` asks three CLIs at a time. All at once, they fight over the CPU and
+  slow ones (`opencode models` takes about five seconds) run past their
+  time limits.
