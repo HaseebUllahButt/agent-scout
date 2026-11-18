@@ -896,3 +896,182 @@ export async function anthropicCurrentModels(options = {}) {
   return anthropicCache.page?.current ?? [];
 }
 
+// ----------------------------------------------------------------- opencode
+
+/** Only expose effort levels the provider actually advertises for a model. */
+export function parseOpencodeModelCache(catalog) {
+  const effortsByModel = {}, labels = {}, attachmentByModel = {};
+  for (const [provider, prov] of Object.entries(catalog ?? {})) {
+    for (const [id, meta] of Object.entries(prov?.models ?? {})) {
+      if (!meta || typeof meta !== 'object') continue;
+      const slug = `${provider}/${id}`;
+      if (meta.name) labels[slug] = meta.name;
+      if (typeof meta.attachment === 'boolean') attachmentByModel[slug] = meta.attachment;
+      const effortOpt = (Array.isArray(meta.reasoning_options) ? meta.reasoning_options : [])
+        .find((o) => o?.type === 'effort');
+      if (Array.isArray(effortOpt?.values)) {
+        effortsByModel[slug] = [...new Set(effortOpt.values.filter((v) => typeof v === 'string' && v))];
+      } else if (meta.reasoning === false) {
+        effortsByModel[slug] = [];
+      }
+    }
+  }
+  return { effortsByModel, labels, attachmentByModel };
+}
+
+/**
+ * OpenCode 2 answers a command through its background service, starting one
+ * when none runs, and that service stays up long after the answer. Asking for
+ * the model list would leave it running for good. `--standalone` uses a
+ * private server that exits with the command; OpenCode 1 has no such flag.
+ */
+async function opencodeExec(bin, args, options) {
+  try { return await exec(bin, [...args, '--standalone'], options); }
+  catch { return exec(bin, args, options); }
+}
+
+async function opencodeModels(root, bin = 'opencode', environment = {}, net = network()) {
+  let def = null;
+  for (const name of ['opencode.jsonc', 'opencode.json']) {
+    try {
+      // Both versions accept JSONC; v2 documents the .jsonc spelling first.
+      const raw = readFileSync(join(root, 'opencode', name), 'utf8')
+        .replace(/^\s*\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '')
+        .replace(/,\s*([}\]])/g, '$1');
+      const cfg = JSON.parse(raw);
+      if (typeof cfg.model === 'string') def = cfg.model;
+      break;
+    } catch { /* try the other spelling */ }
+  }
+  let stdout;
+  let source = `${bin.split('/').pop()} models`;
+  try {
+    // The normal command reads OpenCode's existing local catalog. Only try
+    // its network-refresh path when there is no usable local answer.
+    ({ stdout } = await opencodeExec(bin, ['models'], {
+      timeout: 8_000,
+      env: { ...process.env, ...environment, XDG_CONFIG_HOME: root },
+    }));
+    if (!stdout.split('\n').some((line) => line.trim().includes('/'))) {
+      throw new Error('opencode returned no local model rows');
+    }
+  } catch {
+    // `--refresh` is a fallback for an empty/broken local catalog, never the
+    // first step on every request.
+    ({ stdout } = await opencodeExec(bin, ['models', '--refresh'], {
+      timeout: 20_000,
+      env: { ...process.env, ...environment, XDG_CONFIG_HOME: root },
+    }));
+    source += ' --refresh';
+  }
+  const models = stdout.split('\n').map((l) => l.trim()).filter((l) => l && l.includes('/'));
+  if (def && !models.includes(def)) models.unshift(def);
+  const signedOut = await refusedOpencodeKeys(bin, root, environment, net);
+  const refused = (m) => signedOut.some((p) => m.startsWith(`${p}/`));
+  // OpenCode lists opencode-go/ before opencode/, so with no configured
+  // default its own pick is a Go model: a new chat would fail on a dead key.
+  const startModel = signedOut.length && (!def || refused(def)) ? models.find((m) => !refused(m)) ?? null : null;
+
+  // Expose correct reasoning levels from opencode's models cache (provider metadata
+  // at models.dev). This is the source of truth for zen/opencode models - e.g.
+  // muse-spark-1.2-contributor-free supports up to xhigh, not max (only
+  // muse-spark-1.3 non-free has max). Without this a caller would offer an
+  // invalid level or hide a valid one.
+  let effortsByModel = {};
+  let labels = {};
+  let attachmentByModel = {};
+  try {
+    const cacheFiles = [
+      join(environment.XDG_CACHE_HOME || process.env.XDG_CACHE_HOME
+        || join(environment.HOME || process.env.HOME || HOME, '.cache'), 'opencode', 'models.json'),
+      join(root, '..', '.cache', 'opencode', 'models.json'),
+    ];
+    let found = null;
+    for (const f of cacheFiles) {
+      if (!existsSync(f)) continue;
+      try { found = JSON.parse(readFileSync(f, 'utf8')); break; } catch { /* next */ }
+    }
+    // Providers sit at the top level - opencode, opencode-go, opencode-zen
+    // and any custom ones - each holding model ids without the prefix.
+    ({ effortsByModel, labels, attachmentByModel } = parseOpencodeModelCache(found));
+  } catch { /* a live session would advertise its actual levels */ }
+
+  return {
+    default: startModel ?? def,
+    ...(signedOut.length ? { signedOut, startModel } : {}),
+    models,
+    labels,
+    efforts: [],
+    effortsByModel,
+    attachmentByModel,
+    images: models.some((m) => attachmentByModel[m]),
+    imagesByModel: { ...attachmentByModel },
+    source,
+  };
+}
+
+/**
+ * OpenCode's own services answer their public model list to anyone, but
+ * refuse it with 401 for an expired or revoked key. `opencode auth list`
+ * still shows such a key as stored, so this is the only cheap way to tell:
+ * it costs no usage, and the key goes only where OpenCode sends it anyway.
+ */
+const OPENCODE_KEY_CHECKS = {
+  opencode: 'https://opencode.ai/zen/v1/models',
+  'opencode-go': 'https://opencode.ai/zen/go/v1/models',
+};
+
+/** OpenCode providers whose saved key the service refuses. */
+async function refusedOpencodeKeys(bin, root, environment = {}, net = network()) {
+  const keys = new Map();
+  try {
+    // V2 keeps keys in its database and prints them with `auth export`.
+    const { stdout } = await opencodeExec(bin, ['auth', 'export'], {
+      timeout: 8_000,
+      env: { ...process.env, ...environment, XDG_CONFIG_HOME: root },
+    });
+    for (const c of JSON.parse(stdout)) {
+      if (c?.active && c.value?.type === 'key' && c.value.key) keys.set(c.integrationID, c.value.key);
+    }
+  } catch {
+    // V1 keeps them in <data home>/opencode/auth.json.
+    try {
+      const dataHome = environment.XDG_DATA_HOME || process.env.XDG_DATA_HOME
+        || join(environment.HOME || process.env.HOME || HOME, '.local', 'share');
+      const saved = JSON.parse(readFileSync(join(dataHome, 'opencode', 'auth.json'), 'utf8'));
+      for (const [id, c] of Object.entries(saved ?? {})) if (c?.type === 'api' && c.key) keys.set(id, c.key);
+    } catch { /* no saved keys */ }
+  }
+  // Offline there is no one to ask; a stored key counts as working.
+  if (net.offline) return [];
+  const refused = await Promise.all([...keys].filter(([id]) => OPENCODE_KEY_CHECKS[id]).map(async ([id, key]) => {
+    try {
+      const r = await net.fetch(OPENCODE_KEY_CHECKS[id], {
+        headers: { authorization: `Bearer ${key}` },
+        signal: AbortSignal.timeout(8_000),
+      });
+      return r.status === 401 || r.status === 403 ? id : null;
+    } catch { return null; }
+  }));
+  return refused.filter(Boolean);
+}
+
+/**
+ * Move models of a provider whose sign-in the service refuses to `more`, so
+ * a picker offers what works first. A live session lists them again, so
+ * this runs on the final answer, not only on the cached catalogue.
+ */
+export function setAsideSignedOut(list) {
+  const out = list?.signedOut;
+  if (!out?.length || !list.models?.length) return list;
+  const refused = (m) => out.some((p) => m.startsWith(`${p}/`));
+  const keep = list.models.filter((m) => !refused(m));
+  if (!keep.length) return list;
+  return {
+    ...list,
+    models: keep,
+    more: [...(list.more ?? []).filter((m) => !refused(m)), ...list.models.filter(refused), ...(list.more ?? []).filter(refused)],
+    default: list.default && refused(list.default) ? list.startModel ?? keep[0] : list.default,
+  };
+}
+
