@@ -662,3 +662,237 @@ async function codexCatalog(root, environment = {}, bin = 'codex', net = network
     : { catalog: null, source: null };
 }
 
+// ------------------------------------------------------------------- claude
+
+// Only what the list shows before Models.dev answers; newest first.
+const CLAUDE_FALLBACK_FAMILY = [
+  'claude-fable-5-2', 'claude-haiku-5-5', 'claude-sonnet-5-5', 'claude-opus-5-5', 'claude-fable-5-1', 'claude-opus-5', 'claude-sonnet-5',
+];
+
+const CLAUDE_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
+
+/** Claude Code keeps its global config in ~/.claude.json unless CLAUDE_CONFIG_DIR moves it. */
+function readClaudeConfig(root) {
+  const files = [join(root, '.claude.json')];
+  if (root === expand('~/.claude')) files.push(join(dirname(root), '.claude.json'));
+  for (const file of files) {
+    try { return JSON.parse(readFileSync(file, 'utf8')); } catch { /* try the next */ }
+  }
+  return null;
+}
+
+/**
+ * The Claude Code CLI accepts a model id but does not expose a model-list
+ * command. Models.dev is Anthropic's current public catalog, so use it as an
+ * additive overlay; the configured model and an already-running session
+ * still win when they know more about this account.
+ */
+async function claudeModels(root, environment = {}, net = network()) {
+  const [listed, official] = await Promise.all([modelsDevProvider('anthropic', net), anthropicPublishedModels(net)]);
+  const published = {
+    models: [...listed.models, ...official.models],
+    labels: { ...official.labels, ...listed.labels },
+    imagesByModel: listed.imagesByModel,
+    releasedAt: { ...official.releasedAt, ...listed.releasedAt },
+  };
+  const seen = new Set([...CLAUDE_FALLBACK_FAMILY, ...published.models]);
+  let def = null;
+  const cfg = readClaudeConfig(root);
+  if (cfg) {
+    // Top-level `model` is the account default; projects carry their own.
+    if (typeof cfg.model === 'string') def = cfg.model;
+    for (const p of Object.values(cfg.projects ?? {})) {
+      if (typeof p?.model === 'string') seen.add(p.model);
+    }
+  }
+  // What a chat started without --model really runs: ANTHROPIC_MODEL, else
+  // the account's settings.json - often an alias such as "opus". Its
+  // `effortLevel` is the thinking level it starts with.
+  let settings = {};
+  try { settings = JSON.parse(readFileSync(join(root, 'settings.json'), 'utf8')) ?? {}; } catch { /* none */ }
+  const chosen = [environment.ANTHROPIC_MODEL, settings.env?.ANTHROPIC_MODEL, settings.model]
+    .find((v) => typeof v === 'string' && v.trim() && v.trim() !== 'default');
+  // Newest first, so a model that shipped this week sits at the top of the
+  // list instead of behind two years of older ones (Models.dev dates each).
+  const models = newestFirst([...seen], published.releasedAt);
+  if (chosen) def = claudeAlias(chosen.trim(), models) ?? def;
+  if (def && !models.includes(def)) models.unshift(def);
+  const labels = { 'claude-opus-5-5': 'Claude Opus 5.5', 'claude-fable-5-2': 'Claude Fable 5.2', ...published.labels };
+  // `claude --effort`; without a saved level the default depends on the
+  // model, so none is claimed. Every model in the family takes image input.
+  const effort = CLAUDE_EFFORTS.includes(settings.effortLevel) ? settings.effortLevel : null;
+  const sources = ['Claude config'];
+  if (listed.models.length) sources.push('models.dev');
+  if (official.models.length) sources.push('Anthropic models page');
+  if (sources.length === 1) sources.push('built-in list');
+  return {
+    default: def, models, labels, effort, efforts: CLAUDE_EFFORTS,
+    images: true,
+    imagesByModel: Object.fromEntries(models.map((m) => [m, published.imagesByModel[m] ?? true])),
+    releasedAt: published.releasedAt,
+    source: sources.join(' + '),
+  };
+}
+
+/**
+ * A Claude model setting as the id it runs: "opus" and "opusplan" mean the
+ * newest Opus, "sonnet[1m]" the newest Sonnet. A full id stays itself.
+ */
+export function claudeAlias(value, models) {
+  const plain = value.replace(/\[[^\]]*\]$/, '');
+  if (models.includes(plain) || plain.startsWith('claude-')) return plain;
+  const family = /^(opus|sonnet|haiku|fable)(plan)?$/.exec(plain)?.[1];
+  return family ? models.find((m) => m.startsWith(`claude-${family}-`) && !isSnapshot(m)) ?? null : null;
+}
+
+/** Read one provider's rows from the public Models.dev catalog. */
+export function parseModelsDevProvider(catalog, provider) {
+  const rows = catalog?.[provider]?.models;
+  const models = [];
+  const labels = {};
+  const imagesByModel = {};
+  const releasedAt = {};
+  if (!rows || typeof rows !== 'object') return { models, labels, imagesByModel, releasedAt };
+  for (const [id, meta] of Object.entries(rows)) {
+    if (!id || /review|reserve|deprecated/i.test(id)) continue;
+    models.push(id);
+    if (typeof meta?.name === 'string' && meta.name.trim()) labels[id] = meta.name.trim();
+    if (typeof meta?.attachment === 'boolean') imagesByModel[id] = meta.attachment;
+    if (typeof meta?.release_date === 'string' && meta.release_date.trim()) releasedAt[id] = meta.release_date.trim();
+  }
+  return { models, labels, imagesByModel, releasedAt };
+}
+
+/** A dated snapshot ("claude-haiku-4-5-20251001") is a pin, not a new choice. */
+const isSnapshot = (id) => /-\d{8}$/.test(id);
+
+/**
+ * Newest release first; ids the catalog does not date keep their order and
+ * sit between the dated ones and the pinned snapshots, which go last. A
+ * stable sort, so two models released the same day stay in catalog order.
+ */
+export function newestFirst(ids, releasedAt = {}) {
+  const rank = (id) => (isSnapshot(id) ? 2 : releasedAt[id] ? 0 : 1);
+  return ids
+    .map((id, i) => ({ id, i }))
+    .sort((a, b) => rank(a.id) - rank(b.id)
+      || (releasedAt[b.id] ?? '').localeCompare(releasedAt[a.id] ?? '')
+      || a.i - b.i)
+    .map((x) => x.id);
+}
+
+/** Resolves once catalog refreshes already in progress have ended. */
+export async function modelsSettled(engine, home, launcher = null) {
+  const pending = () => engine ? pendingRefreshes(engine, modelsKey(engine, home, launcher)) : [
+    modelsDevInflight, anthropicInflight, codexManifestInflight, ...inflight.values(),
+    ...codexRefreshes.values(), ...publicRefreshes.values(),
+  ].filter(Boolean);
+  // A public fetch can start an account rebuild. Follow that work too,
+  // without waiting for another account's CLI or another provider.
+  for (let jobs = pending(); jobs.length; jobs = pending()) await Promise.allSettled(jobs);
+}
+
+/** Return stale public data immediately and refresh it once in the background. */
+function modelsDevCatalog(net = network()) {
+  const now = Date.now();
+  if (!net.offline
+      && now - modelsDevCache.at >= MODELS_DEV_TTL_MS
+      && now - modelsDevCache.checkedAt >= PUBLIC_CATALOG_RETRY_MS
+      && !modelsDevInflight) {
+    modelsDevCache.checkedAt = now;
+    modelsDevInflight = (async () => {
+      try {
+        const response = await net.fetch(process.env.AGENT_SCOUT_MODELS_DEV_URL || MODELS_DEV_URL, {
+          headers: { accept: 'application/json' },
+          signal: AbortSignal.timeout(5_000),
+        });
+        if (!response.ok) throw new Error(`models.dev returned ${response.status}`);
+        const catalog = await response.json();
+        if (!catalog || typeof catalog !== 'object') throw new Error('models.dev returned no catalog');
+        modelsDevCache = { at: Date.now(), checkedAt: Date.now(), catalog };
+        savePublic();
+        refreshDiscoveredModels(new Set(['claude', 'gemini']));
+      } catch { /* keep the last good catalog and back off before retrying */ }
+    })().finally(() => { modelsDevInflight = null; });
+  }
+  return Promise.resolve(modelsDevCache.catalog ?? {});
+}
+
+async function modelsDevProvider(provider, net) {
+  return parseModelsDevProvider(await modelsDevCatalog(net), provider);
+}
+
+const MONTHS = ['january', 'february', 'march', 'april', 'may', 'june', 'july',
+  'august', 'september', 'october', 'november', 'december'];
+const stripLinks = (s) => s.replace(/\[([^\]]*)\]\([^)]*\)/g, '$1').trim();
+
+/**
+ * Read Anthropic's model page: the comparison table gives each current
+ * model's name and API id. Its retirement date is "not sooner than" one year
+ * after release, so a year back from it dates a model that Models.dev does
+ * not know yet. The "Legacy models" links add the older ids.
+ */
+export function parseAnthropicModelsPage(text) {
+  const out = { models: [], current: [], labels: {}, releasedAt: {} };
+  const page = String(text ?? '');
+  const rows = page.split('\n').filter((l) => l.trim().startsWith('|'))
+    .map((l) => l.trim().replace(/^\||\|$/g, '').split('|').map((c) => c.trim()));
+  const first = (pattern) => rows.find((r) => pattern.test(stripLinks(r[0] ?? '')));
+  const header = first(/^Feature$/i);
+  const ids = first(/^Claude API ID$/i);
+  const retire = first(/^Retirement$/i);
+  const add = (id, label) => {
+    if (!out.models.includes(id)) out.models.push(id);
+    if (label && !out.labels[id]) out.labels[id] = label;
+  };
+  for (let i = 1; header && ids && i < ids.length; i++) {
+    const id = /`(claude-[a-z0-9-]+)`/.exec(ids[i])?.[1];
+    if (!id) continue;
+    add(id, stripLinks(header[i] ?? ''));
+    if (!out.current.includes(id)) out.current.push(id);
+    const when = /([A-Za-z]+) (\d{1,2}), (\d{4})/.exec(retire?.[i] ?? '');
+    const month = when ? MONTHS.indexOf(when[1].toLowerCase()) : -1;
+    if (month >= 0) {
+      out.releasedAt[id] = new Date(Date.UTC(Number(when[3]) - 1, month, Number(when[2]))).toISOString().slice(0, 10);
+    }
+  }
+  const legacy = /Legacy models[^\n]*/i.exec(page)?.[0] ?? '';
+  for (const m of legacy.matchAll(/\[(Claude [^\]]+)\]\([^)]*\/models\/([a-z]+-\d+(?:-\d+)?)\/overview\)/g)) {
+    add(`claude-${m[2]}`, m[1]);
+  }
+  return out;
+}
+
+/** Return the last good page at once and refresh it in the background. */
+function anthropicPublishedModels(net = network()) {
+  const now = Date.now();
+  if (!net.offline
+      && now - anthropicCache.at >= MODELS_DEV_TTL_MS
+      && now - anthropicCache.checkedAt >= PUBLIC_CATALOG_RETRY_MS
+      && !anthropicInflight) {
+    anthropicCache.checkedAt = now;
+    anthropicInflight = (async () => {
+      try {
+        const response = await net.fetch(process.env.AGENT_SCOUT_ANTHROPIC_MODELS_URL || ANTHROPIC_MODELS_URL, {
+          headers: { accept: 'text/markdown, text/plain' },
+          signal: AbortSignal.timeout(5_000),
+        });
+        if (!response.ok) throw new Error(`Anthropic model page returned ${response.status}`);
+        const page = parseAnthropicModelsPage(await response.text());
+        if (!page.models.length) throw new Error('Anthropic model page lists no models');
+        anthropicCache = { at: Date.now(), checkedAt: Date.now(), page };
+        savePublic();
+        refreshDiscoveredModels(new Set(['claude']));
+      } catch { /* keep the last good page and back off before retrying */ }
+    })().finally(() => { anthropicInflight = null; });
+  }
+  return Promise.resolve(anthropicCache.page ?? { models: [], current: [], labels: {}, releasedAt: {} });
+}
+
+/** The current lineup on Anthropic's page (not the legacy ids), fetched now if needed. */
+export async function anthropicCurrentModels(options = {}) {
+  void anthropicPublishedModels(network(options));
+  if (anthropicInflight) await anthropicInflight;
+  return anthropicCache.page?.current ?? [];
+}
+
