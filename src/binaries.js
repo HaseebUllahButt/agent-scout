@@ -65,3 +65,72 @@ export async function missingModels(file, ids) {
   return [...left];
 }
 
+// ------------------------------------------------------------ small helpers
+
+const slash = (p) => String(p).replaceAll('\\', '/');
+export const stripAnsi = (s) => String(s ?? '').replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
+
+/** First version-looking token of `tool --version` ("codex-cli 0.161.0", "2026.08.11-e8db854"). */
+export function parseVersion(text) {
+  const m = stripAnsi(text).match(/\d+\.\d+(?:\.\d+)*(?:-[0-9A-Za-z.]+)?/);
+  return m ? m[0] : null;
+}
+
+/** Is `latest` ahead of `have`? Numbers only; anything unreadable says no. */
+export function isNewer(latest, have) {
+  if (!latest || !have) return false;
+  const nums = (v) => String(v).split('-')[0].split('.').map((n) => Number.parseInt(n, 10));
+  const a = nums(latest), b = nums(have);
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const x = a[i] || 0, y = b[i] || 0;
+    if (Number.isNaN(x) || Number.isNaN(y)) return false;
+    if (x !== y) return x > y;
+  }
+  return false;
+}
+
+const inside = (child, parent) => {
+  const rel = relative(parent, child);
+  return !!rel && !rel.startsWith('..') && !isAbsolute(rel);
+};
+
+const writable = (p) => { try { accessSync(p, constants.W_OK); return true; } catch { return false; } };
+
+const packageName = (dir) => {
+  try { return JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')).name ?? null; } catch { return null; }
+};
+
+/** A forwarding launcher (see SHIM_MARKERS), never the tool itself. */
+export const isShim = (path) => {
+  try {
+    const st = lstatSync(path);
+    if (!st.isFile() || st.size >= 16_384) return false;
+    const text = readFileSync(path, 'utf8');
+    return SHIM_MARKERS.some((m) => text.includes(m));
+  } catch { return false; }
+};
+
+/**
+ * The real program behind a command name. Launcher scripts are skipped on
+ * purpose - they only forward to the tool, and the tool is what gets its
+ * version read. `skipDirs` are folders never to look in.
+ */
+export function findBinary(names, { PATH = process.env.PATH ?? '', platform = process.platform, skipDirs = [] } = {}) {
+  const exts = platform === 'win32' ? ['', ...(process.env.PATHEXT ?? '.EXE;.CMD').split(';').filter(Boolean)] : [''];
+  for (const bin of names) {
+    for (const dir of PATH.split(platform === 'win32' ? ';' : delimiter)) {
+      if (!dir || skipDirs.includes(dir)) continue;
+      for (const ext of exts) {
+        const path = join(dir, bin + ext);
+        try {
+          if (!statSync(path).isFile()) continue;
+          accessSync(path, constants.X_OK);
+          if (isShim(path)) continue;
+          return { bin, path };
+        } catch { /* not here */ }
+      }
+    }
+  }
+  return null;
+}
+
