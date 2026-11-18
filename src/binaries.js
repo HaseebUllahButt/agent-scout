@@ -134,3 +134,82 @@ export function findBinary(names, { PATH = process.env.PATH ?? '', platform = pr
   return null;
 }
 
+// -------------------------------------------------------------- install kind
+
+// Places a package manager or the system owns. Updating something there is
+// not ours to do, whatever the tool's own updater might try.
+const OTHER_OWNERS = [
+  [/\/(Cellar|homebrew|\.linuxbrew|linuxbrew)(\/|$)/i, 'homebrew', 'installed by Homebrew - update it with brew'],
+  [/^\/(usr|opt|bin|sbin|snap|nix|Applications|Library|var\/lib\/flatpak)(\/|$)/, 'system', 'installed by the system - update it with the system’s package manager'],
+  [/\/(Program Files|Program Files \(x86\)|WindowsApps)(\/|$)/i, 'system', 'installed by the system - update it with the system’s package manager'],
+  [/\/\.bun\//, 'other', 'installed with bun - update it with bun'],
+  [/\/(pnpm|\.pnpm)(\/|$)|\/\.local\/share\/pnpm\//, 'other', 'installed with pnpm - update it with pnpm'],
+  [/\/\.(yarn|config\/yarn)\//, 'other', 'installed with yarn - update it with yarn'],
+  [/\/(\.local\/share\/uv|\.local\/pipx|pipx)\//, 'other', 'installed with Python tooling - update it there'],
+  [/\/\.cargo\//, 'other', 'installed with cargo - update it with cargo'],
+];
+
+/**
+ * How `realPath` (the file after following links) was installed, and the one
+ * safe command that updates it - or why none exists. Pure, so every case can
+ * be tried with made-up paths. agent-scout never runs the command; it is
+ * reported so the caller can.
+ */
+export function classifyInstall(engine, realPath, {
+  npmRoot = null, home = HOME, platform = process.platform,
+  canWrite = writable, pkgNameOf = packageName,
+} = {}) {
+  const spec = UPDATERS[engine];
+  const path = slash(realPath);
+  const no = (method, reason) => ({ method, canUpdate: false, reason });
+  if (!spec) return no('other', 'no automatic updater is known for this tool');
+
+  // 1. A package inside npm's own global folder, and one we recognise.
+  const root = npmRoot ? slash(npmRoot) : null;
+  if (root && inside(path, root)) {
+    const parts = path.slice(root.length).split('/').filter(Boolean);
+    const pkg = parts[0]?.startsWith('@') ? parts.slice(0, 2).join('/') : parts[0];
+    const pkgDir = join(npmRoot, ...(pkg ?? '').split('/'));
+    if (!pkg || !spec.npm?.includes(pkg) || pkgNameOf(pkgDir) !== pkg) {
+      return no('npm', `installed with npm as ${pkg ?? 'an unknown package'}, which agent-scout does not recognise as this tool`);
+    }
+    if (!canWrite(npmRoot) || !canWrite(pkgDir)) return no('npm', 'installed with npm in a folder this user can not write to');
+    return { method: 'npm', canUpdate: true, pkg, command: { cmd: 'npm', args: ['install', '-g', `${pkg}@latest`] } };
+  }
+  // 2. Somebody else's install: never ours to change. (Checked before the
+  // generic npm case so bun's and pnpm's node_modules are named correctly.)
+  for (const [pattern, method, reason] of OTHER_OWNERS) {
+    if (pattern.test(path)) return no(method, reason);
+  }
+
+  // 2b. npm with its own folder in this user's home (`npm i -g --prefix
+  // ~/.local`), used where npm's default folder needs sudo. That same
+  // folder is where the update goes.
+  const own = platform === 'win32' ? null : /^(.+)\/lib\/node_modules\/((?:@[^/]+\/)?[^/]+)\//.exec(path);
+  // A Node version manager's folder belongs to its own Node and npm.
+  const manager = /\/(\.nvm|\.fnm|\.volta|\.asdf|\.local\/share\/fnm|n\/versions)\//.test(path);
+  if (own && !manager && own[1].startsWith(slash(home) + '/') && spec.npm?.includes(own[2])) {
+    const pkgDir = join(own[1], 'lib', 'node_modules', ...own[2].split('/'));
+    if (pkgNameOf(pkgDir) !== own[2]) return no('npm', `installed with npm as ${own[2]}, which agent-scout does not recognise as this tool`);
+    if (!canWrite(join(own[1], 'lib', 'node_modules')) || !canWrite(pkgDir)) return no('npm', 'installed with npm in a folder this user can not write to');
+    return { method: 'npm', canUpdate: true, pkg: own[2], command: { cmd: 'npm', args: ['install', '-g', '--prefix', own[1], `${own[2]}@latest`] } };
+  }
+
+  if (path.includes('/node_modules/')) {
+    return no('npm', root
+      ? 'installed with npm somewhere other than the npm agent-scout found (another Node version?)'
+      : 'installed with npm, but agent-scout can not find npm');
+  }
+
+  // 3. The tool's own updater, only for a copy that lives in this user's home.
+  if (spec.self) {
+    const h = slash(home);
+    const mine = platform === 'win32' ? path.toLowerCase().startsWith(h.toLowerCase() + '/') : path.startsWith(h + '/');
+    if (!mine) return no('other', 'installed outside your home folder - update it where it was installed');
+    if (!canWrite(dirname(realPath))) return no('self', 'its folder is not writable by this user');
+    const curl = spec.curl && path.startsWith(`${slash(home)}/.opencode/bin/`);
+    return { method: 'self', canUpdate: true, command: { cmd: null, args: curl ? spec.curl : spec.self } };
+  }
+  return no('other', 'no automatic updater is known for this install');
+}
+
