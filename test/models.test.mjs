@@ -1,0 +1,241 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+
+test('live effort options override only the current model without mutating the shared catalog', async () => {
+  const { mergeLiveModelCatalog } = await import('../src/models.js');
+  const cached = {
+    models: ['heavy', 'light', 'plain'], labels: { light: 'Light' }, default: 'heavy',
+    efforts: ['low', 'high', 'max'], effortsByModel: { heavy: ['low', 'high', 'max'], light: ['low', 'max'] },
+  };
+  const original = structuredClone(cached);
+  const { models, extra } = mergeLiveModelCatalog(cached, {
+    models: ['light', 'plain'], current: 'light', effort: 'low', efforts: ['low', 'medium'],
+  });
+  assert.deepEqual(models.effortsByModel.light, ['low', 'medium']);
+  assert.deepEqual(models.effortsByModel.heavy, ['low', 'high', 'max']);
+  assert.deepEqual(extra, ['heavy']);
+  assert.equal(models.effort, 'low');
+  assert.deepEqual(models.efforts, [], 'current-model levels are never a fallback for other models');
+  const plain = mergeLiveModelCatalog(cached, { current: 'plain', efforts: [] }).models;
+  assert.deepEqual(plain.effortsByModel.plain, []);
+  assert.deepEqual(plain.effortsByModel.heavy, ['low', 'high', 'max']);
+  assert.deepEqual(cached, original);
+});
+
+test('OpenCode metadata keeps explicit empty efforts and never borrows another model levels', async () => {
+  const { parseOpencodeModelCache } = await import('../src/models.js');
+  const parsed = parseOpencodeModelCache({ provider: { models: {
+    heavy: { reasoning_options: [{ type: 'effort', values: ['low', 'high', 'max'] }] },
+    light: { reasoning_options: [{ type: 'effort', values: ['low', 'medium', 'low'] }] },
+    plain: { reasoning: false },
+    empty: { reasoning_options: [{ type: 'effort', values: [] }] },
+    unknown: { reasoning: true },
+  } } });
+  assert.deepEqual(parsed.effortsByModel, {
+    'provider/heavy': ['low', 'high', 'max'], 'provider/light': ['low', 'medium'],
+    'provider/plain': [], 'provider/empty': [],
+  });
+});
+
+test('Devin model detection accepts newly added model families', async () => {
+  const { parseDevinModelList } = await import('../src/models.js');
+  const found = parseDevinModelList(`
+Claude Opus 5.5 (claude-opus-5-5)
+  aliases: opus
+  claude-opus-5-5-medium       Claude Opus 5.5 Medium       [1M context, $5 / 1M Input]
+  claude-opus-5-5-high         Claude Opus 5.5 High         [1M context, $5 / 1M Input]
+`);
+
+  assert.deepEqual(found.models, ['claude-opus-5-5-medium', 'claude-opus-5-5-high']);
+  assert.equal(found.labels['claude-opus-5-5-medium'], 'Claude Opus 5.5 Medium');
+});
+
+test('Codex model detection accepts provider models added after agent-scout ships', async () => {
+  const { mergeCodexPublishedModels, parseCodexModelList } = await import('../src/models.js');
+  const found = parseCodexModelList(mergeCodexPublishedModels({ models: [
+    { model: 'gpt-6-astra', displayName: 'GPT-6-Astra' },
+  ] }, ['gpt-6-luna', 'gpt-6-sol']).models.filter((m) => m.model === 'gpt-6-luna'));
+
+  assert.deepEqual(mergeCodexPublishedModels({ models: ['gpt-6-astra'] }, ['gpt-6-luna', 'gpt-6-luna']).models, [
+    'gpt-6-astra',
+    { model: 'gpt-6-luna', displayName: 'GPT-6-Luna', supportedReasoningEfforts: ['none', 'low', 'medium', 'high', 'xhigh', 'max'], inputModalities: ['text', 'image'] },
+  ]);
+
+  const detailed = parseCodexModelList([
+    {
+      model: 'gpt-6-luna',
+      displayName: 'GPT-6-Luna',
+      isDefault: true,
+      supportedReasoningEfforts: [
+        { reasoningEffort: 'low' },
+        { reasoningEffort: 'xhigh' },
+      ],
+      additionalSpeedTiers: ['fast'],
+      inputModalities: ['text', 'image'],
+    },
+  ]);
+
+  assert.deepEqual(found.models, ['gpt-6-luna']);
+  assert.deepEqual(detailed.models, ['gpt-6-luna']);
+  assert.equal(detailed.default, 'gpt-6-luna');
+  assert.equal(detailed.labels['gpt-6-luna'], 'GPT-6-Luna');
+  assert.deepEqual(detailed.effortsByModel['gpt-6-luna'], ['low', 'xhigh']);
+  assert.deepEqual(detailed.speedByModel['gpt-6-luna'], ['fast']);
+  assert.equal(detailed.imagesByModel['gpt-6-luna'], true);
+});
+
+test('Claude model detection accepts newly published catalog entries', async () => {
+  const { parseModelsDevProvider } = await import('../src/models.js');
+  const found = parseModelsDevProvider({ anthropic: { models: {
+    'claude-sonnet-5': { name: 'Claude Sonnet 5', attachment: true },
+    'claude-old-review': { name: 'Old review model' },
+  } } }, 'anthropic');
+
+  assert.deepEqual(found.models, ['claude-sonnet-5']);
+  assert.equal(found.labels['claude-sonnet-5'], 'Claude Sonnet 5');
+  assert.equal(found.imagesByModel['claude-sonnet-5'], true);
+});
+
+test('Devin model detection accepts its JSON catalog format', async () => {
+  const { parseDevinModelList } = await import('../src/models.js');
+  const found = parseDevinModelList(JSON.stringify({ families: [{ variants: [
+    { model_uid: 'gpt-6-luna-medium', label: 'GPT-6 Luna Medium' },
+    { id: 'swe-2-high', display_name: 'SWE-2 High' },
+  ] }] }));
+
+  assert.deepEqual(found.models, ['gpt-6-luna-medium', 'swe-2-high']);
+  assert.equal(found.labels['swe-2-high'], 'SWE-2 High');
+});
+
+test('Claude and Gemini lists put the newest published model first and pinned snapshots last', async () => {
+  const { newestFirst, parseModelsDevProvider } = await import('../src/models.js');
+  const published = parseModelsDevProvider({ anthropic: { models: {
+    'claude-haiku-4-5': { name: 'Claude Haiku 4.5', release_date: '2025-10-01' },
+    'claude-haiku-4-5-20251001': { name: 'Claude Haiku 4.5', release_date: '2025-10-01' },
+    'claude-opus-5-5': { name: 'Claude Opus 5.5', release_date: '2026-06-01' },
+    'claude-haiku-5-5': { name: 'Claude Haiku 5.5', release_date: '2026-10-07' },
+  } } }, 'anthropic');
+  assert.equal(published.releasedAt['claude-haiku-5-5'], '2026-10-07');
+  const order = newestFirst(['undated-local', ...published.models], published.releasedAt);
+  assert.deepEqual(order, [
+    'claude-haiku-5-5', 'claude-opus-5-5', 'claude-haiku-4-5', 'undated-local', 'claude-haiku-4-5-20251001',
+  ]);
+});
+
+test('Anthropic model page gives the current lineup, a release day and the legacy ids', async () => {
+  const { parseAnthropicModelsPage, newestFirst } = await import('../src/models.js');
+  const page = [
+    '| Feature | [Claude Fable 5.2](https://x/models/fable-5-2/overview) | Claude Opus 5.5 |',
+    '| :-- | :-- | :-- |',
+    '| Claude API ID | `claude-fable-5-2` | `claude-opus-5-5` |',
+    '| [Retirement](https://x/deprecations) | Not sooner than November 9, 2027 | Not sooner than September 22, 2027 |',
+    '| Claude API alias | `claude-fable-5-2` | `claude-opus-5-5` |',
+    '',
+    'Legacy models (still available): [Claude Fable 5.1](https://x/models/fable-5-1/overview), [Claude Haiku 4.5](https://x/models/haiku-4-5/overview).',
+  ].join('\n');
+  const found = parseAnthropicModelsPage(page);
+  assert.deepEqual(found.current, ['claude-fable-5-2', 'claude-opus-5-5']);
+  assert.deepEqual(found.models, ['claude-fable-5-2', 'claude-opus-5-5', 'claude-fable-5-1', 'claude-haiku-4-5']);
+  assert.equal(found.labels['claude-fable-5-2'], 'Claude Fable 5.2');
+  assert.equal(found.labels['claude-haiku-4-5'], 'Claude Haiku 4.5');
+  assert.deepEqual(found.releasedAt, { 'claude-fable-5-2': '2026-11-09', 'claude-opus-5-5': '2026-09-22' });
+  assert.equal(newestFirst(['claude-opus-5-5', 'claude-fable-5-2'], found.releasedAt)[0], 'claude-fable-5-2');
+  assert.deepEqual(parseAnthropicModelsPage('<html>moved</html>').models, []);
+});
+
+test('Pi model list keeps only the table rows Pi can use', async () => {
+  const { parsePiModelList } = await import('../src/models.js');
+  const rows = parsePiModelList([
+    'provider     model                 context  max-out  thinking  images',
+    'antigravity  gemini-3.8-flash      1.0M     65.5K    yes       yes   ',
+    'opencode     big-pickle            200K     32K      no        no    ',
+    '',
+  ].join('\n'));
+  assert.deepEqual(rows, [
+    { selector: 'antigravity/gemini-3.8-flash', thinking: true, images: true },
+    { selector: 'opencode/big-pickle', thinking: false, images: false },
+  ]);
+  assert.deepEqual(parsePiModelList('No models available. Log in with /login.\n  /opt/pi/docs/models.md\n'), []);
+});
+
+test("Claude's model setting names the model a new chat really starts with", async () => {
+  const { claudeAlias } = await import('../src/models.js');
+  const models = ['claude-haiku-5-5', 'claude-sonnet-5-5', 'claude-opus-5-5', 'claude-opus-5', 'claude-opus-4-5-20251101'];
+  assert.equal(claudeAlias('opus', models), 'claude-opus-5-5');
+  assert.equal(claudeAlias('opusplan', models), 'claude-opus-5-5');
+  assert.equal(claudeAlias('sonnet[1m]', models), 'claude-sonnet-5-5');
+  assert.equal(claudeAlias('claude-opus-5', models), 'claude-opus-5');
+  assert.equal(claudeAlias('fable', models), null);
+  assert.equal(claudeAlias('something-else', models), null);
+});
+
+test('models behind a refused OpenCode key go last and never stay the default', async () => {
+  const { setAsideSignedOut } = await import('../src/models.js');
+  const list = {
+    models: ['opencode-go/beam-free', 'opencode-go/glm-5.3', 'opencode/beam-free', 'opencode/big-pickle'],
+    more: ['opencode/old'], default: 'opencode-go/glm-5.3',
+    signedOut: ['opencode-go'], startModel: 'opencode/beam-free',
+  };
+  const out = setAsideSignedOut(list);
+  assert.deepEqual(out.models, ['opencode/beam-free', 'opencode/big-pickle']);
+  assert.deepEqual(out.more, ['opencode/old', 'opencode-go/beam-free', 'opencode-go/glm-5.3']);
+  assert.equal(out.default, 'opencode/beam-free');
+  assert.equal(setAsideSignedOut({ models: ['opencode-go/a'], signedOut: ['opencode-go'] }).models[0], 'opencode-go/a',
+    'an empty picker is worse than a picker of refused models');
+  assert.equal(setAsideSignedOut({ models: ['a/b'] }).models[0], 'a/b');
+});
+
+test('agy output keeps labels with spaces and skips its status lines', async () => {
+  const { agyModelsFromOutput } = await import('../src/models.js');
+  const found = agyModelsFromOutput('/nonexistent/gemini-home', [
+    'Fetching available models...',
+    'gemini-3.8-flash-high\tGemini 3.8 Flash (High)',
+    'claude-opus-4-6-thinking\tClaude Opus 4.6 (Thinking)',
+    '',
+  ].join('\n'));
+  assert.deepEqual(found.models, ['gemini-3.8-flash-high', 'claude-opus-4-6-thinking']);
+  assert.equal(found.labels['claude-opus-4-6-thinking'], 'Claude Opus 4.6 (Thinking)');
+  assert.deepEqual(found.efforts, ['low', 'medium', 'high', 'max']);
+  assert.equal(found.source, 'agy models');
+});
+
+test('each CLI gets its own spelling of model, effort and "just do it"', async () => {
+  const { optionArgs } = await import('../src/models.js');
+  assert.deepEqual(optionArgs('codex', { model: 'gpt-6-sol', effort: 'high', auto: true }),
+    ['-m', 'gpt-6-sol', '-c', 'model_reasoning_effort="high"', '--yolo']);
+  assert.deepEqual(optionArgs('claude', { model: 'claude-opus-5-5', auto: true }),
+    ['--model', 'claude-opus-5-5', '--permission-mode', 'auto']);
+  assert.deepEqual(optionArgs('antigravity', { model: 'gemini-3.8-flash-high', effort: 'max' }),
+    ['--model', 'gemini-3.8-flash-high', '--effort', 'max']);
+  assert.deepEqual(optionArgs('opencode', { model: 'opencode/beam-free' }), ['-m', 'opencode/beam-free']);
+  assert.deepEqual(optionArgs('vibe', { model: 'x' }), []);
+});
+
+test('a catalog becomes the reported list: per-model efforts, defaults and signed-out providers', async () => {
+  const { normalizeCatalog } = await import('../src/scan.js');
+  const codex = normalizeCatalog('codex', {
+    default: 'gpt-6-sol', models: ['gpt-6-sol', 'gpt-6-luna'], labels: { 'gpt-6-sol': 'GPT-6-Sol' },
+    effort: 'xhigh', efforts: ['low', 'medium', 'high', 'xhigh'],
+    effortsByModel: { 'gpt-6-sol': ['low', 'medium', 'high', 'xhigh'], 'gpt-6-luna': ['low', 'medium'] },
+    defaultEffortByModel: { 'gpt-6-luna': 'medium' }, imagesByModel: { 'gpt-6-sol': true, 'gpt-6-luna': false },
+    source: 'codex debug models',
+  });
+  assert.equal(codex.defaultModel, 'gpt-6-sol');
+  assert.equal(codex.modelSource, 'codex debug models');
+  assert.deepEqual(codex.models[0], {
+    id: 'gpt-6-sol', label: 'GPT-6-Sol', default: true, efforts: ['low', 'medium', 'high', 'xhigh'],
+    defaultEffort: 'xhigh', images: true, new: false,
+  });
+  // The saved level is not one this model takes, so its own starting level shows.
+  assert.equal(codex.models[1].defaultEffort, 'medium');
+  assert.equal(codex.models[1].label, 'gpt-6-luna');
+  assert.equal(codex.models[1].images, false);
+
+  const opencode = normalizeCatalog('opencode', {
+    default: 'opencode-go/a', models: ['opencode-go/a', 'opencode/b'], efforts: [], effortsByModel: {},
+    signedOut: ['opencode-go'], startModel: 'opencode/b',
+  });
+  assert.deepEqual(opencode.models.map((m) => [m.id, m.default, !!m.signedOut]), [['opencode/b', true, false], ['opencode-go/a', false, true]]);
+  assert.deepEqual(opencode.signedOutProviders, ['opencode-go']);
+  assert.deepEqual(opencode.models[0].efforts, []);
+});
