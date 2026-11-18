@@ -239,3 +239,16 @@ In order: the `stateDir` option or `--state-dir`, `$AGENT_SCOUT_STATE_DIR`,
 | `cli-latest.json` | Newest published npm versions, kept 6 hours. |
 
 Deleting the folder is safe: the next scan starts over with a first look.
+
+## Tests
+
+```sh
+node --test
+```
+
+The tests use fake CLIs and local servers. They need no network and none of
+the real CLIs.
+
+## License
+
+PolyForm Noncommercial 1.0.0, see [LICENSE](LICENSE).
