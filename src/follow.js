@@ -167,3 +167,74 @@ export function setModelPrefs(state, { default: def = null, approved = [], auto,
   return clean(next);
 }
 
+// ------------------------------------------------------- the state folder
+
+const load = (options) => readState(FILE, options, {}).accounts ?? {};
+const save = (accounts, options) => writeState(FILE, { accounts }, options);
+
+/** The stored follow record of one account (see the top of this file). */
+export function followState(key, options = {}) {
+  return clean(load(options)[key]);
+}
+
+function update(key, options, fn) {
+  const accounts = load(options);
+  const result = fn(clean(accounts[key]));
+  const state = result?.state ?? result;
+  if (Object.keys(state).length) accounts[key] = state; else delete accounts[key];
+  save(accounts, options);
+  return result;
+}
+
+/**
+ * Record a fresh catalog for an account: { first, fresh, notes }.
+ * `follow: false` only notices; prefs are left as they are.
+ */
+export function observeModels(key, ids, labels = {}, options = {}) {
+  const have = (Array.isArray(ids) ? ids : []).filter((x) => typeof x === 'string' && x.trim());
+  if (!have.length) return { first: false, fresh: [], notes: [], known: followState(key, options).seen ?? [] };
+  let known = [];
+  const result = update(key, options, (state) => {
+    known = state.seen ?? [];
+    return followModels(state, have, labels, options);
+  });
+  return { first: result.first, fresh: result.fresh, notes: result.notes, known };
+}
+
+/** Helm's syncNewModels: record the catalog and return the notes made, or []. */
+export function syncNewModels(key, ids, labels = {}, options = {}) {
+  return observeModels(key, ids, labels, options).notes;
+}
+
+/** The account's model prefs, or null - an absent entry means "offer all". */
+export function modelPrefs(key, options = {}) {
+  const p = followState(key, options).prefs;
+  return p && (p.default || p.approved?.length) ? { default: p.default ?? null, approved: p.approved ?? [] } : null;
+}
+
+export function saveModelPrefs(key, prefs = {}, options = {}) {
+  update(key, options, (state) => setModelPrefs(state, prefs));
+  return modelPrefs(key, options);
+}
+
+/** Whether new models join by themselves (on unless switched off), and the notes about the last ones. */
+export function modelWatch(key, options = {}) {
+  const s = followState(key, options);
+  return { auto: s.auto !== false, news: s.news ?? [] };
+}
+
+/** The owner has seen the notes about models that joined by themselves. */
+export function dismissModelNews(key, options = {}) {
+  update(key, options, (state) => { delete state.news; return state; });
+}
+
+/**
+ * Let new models in a fresh catalog join the account's prefs and, when the
+ * default was the newest of its line, become the default. Only for CLIs
+ * whose model names say what replaces what (FOLLOWED). A catalog still
+ * waiting on the public list is half a picture, so it waits.
+ */
+export function followNewModels(cli, key, catalog, options = {}) {
+  if (!FOLLOWED.has(cli) || !catalog?.models?.length || catalog.refreshing) return [];
+  try { return syncNewModels(key, catalog.models, catalog.labels, options); } catch { return []; }
+}
