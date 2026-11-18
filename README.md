@@ -160,3 +160,17 @@ More is exported for callers that want the pieces: `checkSignedIn`,
 `~/.codex-work` and from shell aliases and wrapper scripts; secret values are
 never reported), `optionArgs` (a CLI's own flags for model, effort and
 "don't stop to ask"), the catalog parsers, and the follow helpers below.
+
+## How CLIs are found
+
+agent-scout asks one login shell where every CLI is (`command -v`), and one
+interactive shell for its PATH, because many installers add their folder in
+`~/.bashrc` only. Forwarding launchers that sit first on PATH (Helm puts one
+per CLI in `~/.helm/bin`) are skipped, so `path` and `version` are the real
+program's. `onPath: false` means the CLI is only reachable from the
+terminal's PATH, so a caller should start it by its full path. Rc files can
+check `AGENT_SCOUT_DISCOVERY=1` to skip anything slow during this look.
+
+The Antigravity ACP agent has no PATH binary. It counts as installed when an
+unpacked runtime is in `~/.helm/tools/antigravity-acp/current` (override with
+`antigravityAcpDir` or `AGENT_SCOUT_ANTIGRAVITY_ACP_DIR`).
