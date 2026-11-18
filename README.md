@@ -59,3 +59,69 @@ that command itself.
 CLI ids: `claude`, `codex`, `opencode`, `antigravity` (alias `agy`),
 `opencode2`, `gemini`, `devin`, `grok`, `cursor`, `vibe`, `pi`, `omp`, `kimi`,
 `muse`, `antigravity-acp`.
+
+## The `scan --json` shape
+
+```json
+{
+  "scannedAt": "2026-11-18T17:00:00.000Z",
+  "clis": [
+    {
+      "id": "codex",
+      "label": "Codex",
+      "aliases": [],
+      "installed": true,
+      "path": "/usr/local/bin/codex",
+      "realPath": "/usr/local/lib/node_modules/@openai/codex/bin/codex.js",
+      "onPath": true,
+      "version": "0.170.0",
+      "home": "/home/user/.codex",
+      "signedIn": true,
+      "defaultModel": "gpt-6.2-sol",
+      "defaultEffort": "high",
+      "models": [
+        {
+          "id": "gpt-6.2-sol",
+          "label": "GPT-6.2-Sol",
+          "default": true,
+          "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+          "defaultEffort": "high",
+          "images": true,
+          "new": false
+        }
+      ],
+      "modelSource": "codex debug models",
+      "error": null
+    }
+  ],
+  "newModels": [
+    { "cli": "codex", "id": "gpt-6.3-sol", "label": "GPT-6.3-Sol", "successor": true }
+  ]
+}
+```
+
+- Every known CLI is listed. A CLI that is not installed has
+  `installed: false`, `path: null` and empty `models`.
+- `signedIn` is `true`, `false`, or `null` when the CLI cannot say. Claude
+  Code, Codex and the Antigravity CLI can say; the rest are `null`.
+- `models[].efforts` are the effort levels that model takes (empty when it
+  has none or the CLI does not say). `defaultEffort` is the level a chat
+  starts with: the account's saved level when the model takes it, otherwise
+  the model's own starting level when the CLI says.
+- `models[].new` is `true` for a model that was not there at the last scan.
+- `modelSource` names where the list came from, for example
+  `codex debug models`, `Claude config + models.dev + Anthropic models page`,
+  `opencode models`, `agy models`.
+- `error` explains an empty model list (`signed out`, `no models found`, or
+  the CLI's own error). It is `null` when models were found.
+- opencode: when a saved key is refused by the service, its provider is in
+  `signedOutProviders`, its models go last with `signedOut: true`, and the
+  default moves to a model that works.
+- `newModels[].successor` is `true` when the model is a newer version of a
+  line the account already had (`claude-opus-5-6` after `claude-opus-5-5`),
+  and `false` for anything else new (an old model that only now showed up, a
+  new provider's models, a name without a readable version).
+
+`agent-scout models <cli> --json` prints one CLI's
+`{ cli, label, installed, path, defaultModel, defaultEffort, models, modelSource, error }`.
+`agent-scout new-models --json` prints `{ checkedAt, newModels }`.
