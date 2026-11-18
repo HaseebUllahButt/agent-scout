@@ -125,3 +125,38 @@ CLI ids: `claude`, `codex`, `opencode`, `antigravity` (alias `agy`),
 `agent-scout models <cli> --json` prints one CLI's
 `{ cli, label, installed, path, defaultModel, defaultEffort, models, modelSource, error }`.
 `agent-scout new-models --json` prints `{ checkedAt, newModels }`.
+
+## Library
+
+```js
+import { scan, findClis, listModels, newModels } from 'agent-scout';
+
+const result = await scan({ clis: ['claude', 'codex'] }); // same shape as scan --json
+const clis = await findClis();                          // [{ id, label, installed, path, version, ... }]
+const codex = await listModels('codex');                // { cli, defaultModel, models, modelSource, ... }
+const fresh = await newModels();                        // [{ cli, id, label, successor }]
+```
+
+Options shared by these calls:
+
+| Option | Meaning |
+| --- | --- |
+| `clis` | Ids to look at (array or `"codex,claude"`). Default: all. |
+| `refresh` | Ignore the age of kept answers. They are still used if the CLI fails. |
+| `offline` | No network calls. `AGENT_SCOUT_OFFLINE=1` does the same. |
+| `fetch` | A replacement for the global `fetch` (tests, proxies). |
+| `stateDir` | The state folder. |
+| `cache` | `false` keeps model lists out of the state folder. |
+| `env` | The environment to look in and run the CLIs with. |
+| `homes` | `{ codex: '~/.codex-work' }`: read another account's home. |
+| `path` | Search this PATH instead of asking the shells. |
+| `shell` | `false` searches only `env.PATH` (or set `AGENT_SCOUT_NO_SHELL=1`). |
+| `track` | `false` makes `scan` leave the "seen models" record alone. |
+| `signin` | `false` skips the sign-in checks. |
+| `concurrency` | How many CLIs `scan` asks at once (default 3). |
+
+More is exported for callers that want the pieces: `checkSignedIn`,
+`checkUpdates`, `findAccounts` (extra accounts from sibling homes such as
+`~/.codex-work` and from shell aliases and wrapper scripts; secret values are
+never reported), `optionArgs` (a CLI's own flags for model, effort and
+"don't stop to ask"), the catalog parsers, and the follow helpers below.
