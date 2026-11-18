@@ -201,3 +201,26 @@ unpacked runtime is in `~/.helm/tools/antigravity-acp/current` (override with
 - `scan` asks three CLIs at a time. All at once, they fight over the CPU and
   slow ones (`opencode models` takes about five seconds) run past their
   time limits.
+
+## How new-model following works
+
+The state folder keeps, for every CLI account (the CLI plus its home folder),
+every model id it has ever listed.
+
+1. The first scan of an account only records what is there. Nothing is
+   reported, so installing agent-scout or a CLI that lists a hundred models
+   at once is not news.
+2. Each later scan compares the list with what was seen. Every id not seen
+   before is marked `new: true` and added to `newModels`, once.
+3. A list that is still loading or came back empty is never recorded, so a
+   network hiccup cannot make old models look new later.
+
+For callers that keep their own short list of models and a default, the
+follow helpers do what Helm's pickers do: `saveModelPrefs(key, { default, approved })`
+stores them, and each scan of a Claude, Codex or Gemini account then adds a
+newly released model to the short list and moves the default to it when the
+default was the newest of its line (`claude-opus-5-5` to `claude-opus-6`, but
+never `gpt-6-sol` to a different line, a dated snapshot, or an alias).
+A model the owner took off the list is never put back. `modelPrefs`,
+`modelWatch` (with the last notes) and `dismissModelNews` read and clear it;
+`followModels` and `setModelPrefs` are the same steps as pure functions.
