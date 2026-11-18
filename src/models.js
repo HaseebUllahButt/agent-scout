@@ -1357,3 +1357,103 @@ export function agyModelsFromOutput(root, stdout) {
 }
 
 /** `kimi provider list --json` lists the configured providers' models. */
+async function kimiModels(environment = {}, bin = 'kimi') {
+  const { stdout } = await exec(bin, ['provider', 'list', '--json'], {
+    timeout: 20_000, maxBuffer: 4 << 20, env: { ...process.env, ...environment },
+  });
+  const models = [];
+  const labels = {};
+  try {
+    const rows = JSON.parse(stdout);
+    for (const p of Array.isArray(rows) ? rows : rows?.providers ?? []) {
+      for (const m of p?.models ?? []) {
+        const id = typeof m === 'string' ? m : m?.id ?? m?.model;
+        if (id && !models.includes(id)) {
+          models.push(id);
+          if (typeof m === 'object' && m?.name) labels[id] = m.name;
+        }
+      }
+    }
+  } catch { /* shape unknown - empty is honest */ }
+  return { default: null, models, labels, source: 'kimi provider list' };
+}
+
+/**
+ * `devin models list` prints family headers ("Claude Opus 5 (claude-opus-5)")
+ * then one indented line per model: `uid   Display Name   [meta]`. The
+ * account's default sits in ~/.config/devin/config.json under agent.model.
+ */
+/** Parse Devin's human-readable catalogue without naming model families here. */
+export function parseDevinModelList(stdout) {
+  try {
+    const payload = JSON.parse(String(stdout ?? ''));
+    const rows = Array.isArray(payload)
+      ? payload
+      : [payload?.models, payload?.data, payload?.items, payload?.results]
+        .find(Array.isArray) ?? [];
+    if (Array.isArray(payload?.families)) {
+      rows.push(...payload.families.flatMap((family) => family?.variants ?? []));
+    }
+    const models = [];
+    const labels = {};
+    const seen = new Set();
+    for (const row of rows) {
+      const id = typeof row === 'string'
+        ? row
+        : row?.model ?? row?.model_uid ?? row?.id ?? row?.uid ?? row?.slug;
+      if (typeof id !== 'string' || !id.trim() || seen.has(id)) continue;
+      seen.add(id);
+      models.push(id);
+      const label = typeof row === 'object'
+        && (row.name ?? row.label ?? row.displayName ?? row.display_name);
+      if (typeof label === 'string' && label.trim()) labels[id] = label.trim();
+    }
+    if (models.length) return { models, labels };
+  } catch { /* Devin's human-readable output is the fallback */ }
+
+  const models = [];
+  const labels = {};
+  const seen = new Set();
+  for (const line of String(stdout ?? '').split('\n')) {
+    // Family headings are flush-left. Model rows are indented and have a
+    // stable two-column shape, even when Devin adds a new family or variant.
+    const m = /^\s{2,}(\S+)\s{2,}(.+?)(?:\s{2,}\[.*)?\s*$/.exec(line);
+    if (!m || m[1] === 'aliases:' || seen.has(m[1])) continue;
+    seen.add(m[1]);
+    models.push(m[1]);
+    labels[m[1]] = m[2].trim();
+  }
+  return { models, labels };
+}
+
+async function devinModels(root, environment = {}, bin = 'devin') {
+  let def = null;
+  try {
+    const cfg = JSON.parse(readFileSync(join(root, 'devin', 'config.json'), 'utf8'));
+    if (typeof cfg?.agent?.model === 'string') def = cfg.agent.model;
+  } catch { /* no config */ }
+  let stdout;
+  try {
+    ({ stdout } = await exec(bin, ['models', 'list', '--format', 'json'], {
+      timeout: 30_000,
+      maxBuffer: 4 << 20,
+      env: { ...process.env, ...environment, XDG_CONFIG_HOME: root },
+    }));
+  } catch {
+    ({ stdout } = await exec(bin, ['models', 'list'], {
+      timeout: 30_000,
+      maxBuffer: 4 << 20,
+      env: { ...process.env, ...environment, XDG_CONFIG_HOME: root },
+    }));
+  }
+  const { models, labels } = parseDevinModelList(stdout);
+  if (def && !models.includes(def)) models.unshift(def);
+  // Devin answers `promptCapabilities.image: true` at ACP `initialize`
+  // (checked against devin 3000.10.21), and that answer is per-agent rather
+  // than per-model.
+  return {
+    default: def, models, labels, images: true, imagesByModel: Object.fromEntries(models.map((m) => [m, true])),
+    source: 'devin models list',
+  };
+}
+
