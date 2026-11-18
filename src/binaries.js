@@ -213,3 +213,38 @@ export function classifyInstall(engine, realPath, {
   return no('other', 'no automatic updater is known for this install');
 }
 
+// ----------------------------------------------------------------- processes
+
+/** Run a program with an argument list (never a shell string) and collect what it says. */
+export function run(cmd, args, { timeout, env = process.env, platform = process.platform } = {}) {
+  return new Promise((resolve) => {
+    const started = Date.now();
+    // npm is a .cmd script on Windows, which only starts through a shell.
+    // Run npm's own script with node instead and no shell is involved.
+    const npmCli = join(dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js');
+    const viaNode = platform === 'win32' && cmd === 'npm';
+    let child;
+    try {
+      child = execFile(viaNode ? process.execPath : cmd, viaNode ? [npmCli, ...args] : args,
+        { timeout, env, maxBuffer: 2 << 20, windowsHide: true },
+        (error, stdout, stderr) => {
+          const out = stripAnsi(`${stdout ?? ''}\n${stderr ?? ''}`).split('\n').map((l) => l.trim()).filter(Boolean);
+          resolve({
+            ok: !error, code: error?.code ?? 0, ms: Date.now() - started, out,
+            timedOut: !!error && (error.killed === true || error.signal === 'SIGTERM'),
+          });
+        });
+    } catch (error) {
+      resolve({ ok: false, code: error?.code ?? 1, ms: 0, out: [], timedOut: false });
+      return;
+    }
+    // Tools sometimes wait for a keypress; nobody is there to give one.
+    child.stdin?.end();
+  });
+}
+
+/** `tool --version`, read as a version string, or null. */
+export async function readVersion(path, { env = process.env, platform = process.platform, timeout = VERSION_TIMEOUT_MS } = {}) {
+  const r = await run(path, ['--version'], { timeout, env, platform });
+  return parseVersion(r.out.join('\n'));
+}
