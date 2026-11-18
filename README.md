@@ -224,3 +224,18 @@ never `gpt-6-sol` to a different line, a dated snapshot, or an alias).
 A model the owner took off the list is never put back. `modelPrefs`,
 `modelWatch` (with the last notes) and `dismissModelNews` read and clear it;
 `followModels` and `setModelPrefs` are the same steps as pure functions.
+
+## State folder
+
+In order: the `stateDir` option or `--state-dir`, `$AGENT_SCOUT_STATE_DIR`,
+`$XDG_STATE_HOME/agent-scout`, `~/.local/state/agent-scout`. Files:
+
+| File | What it holds |
+| --- | --- |
+| `models-cache.json` | The last model list of each CLI account. |
+| `public-catalogs.json` | The last good models.dev (Anthropic and Google parts), Anthropic page and Codex manifest. |
+| `follow.json` | Models seen per account, and optional prefs. |
+| `signin.json` | Sign-in answers, kept 10 minutes. |
+| `cli-latest.json` | Newest published npm versions, kept 6 hours. |
+
+Deleting the folder is safe: the next scan starts over with a first look.
