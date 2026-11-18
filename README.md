@@ -34,3 +34,28 @@ or
 git clone https://github.com/HaseebUllahButt/agent-scout
 node agent-scout/bin/agent-scout.js scan
 ```
+
+## Command line
+
+```sh
+agent-scout scan [--json] [--refresh] [--cli codex,claude]
+agent-scout models <cli> [--json] [--refresh]
+agent-scout new-models [--json] [--cli codex,claude]
+agent-scout updates [--json] [--refresh] [--cli codex,claude]
+```
+
+| Option | What it does |
+| --- | --- |
+| `--json` | Print one JSON document to stdout and nothing else. |
+| `--refresh` | Ask the CLIs again instead of using answers kept for 10 minutes. |
+| `--cli <ids>` | Only these CLIs, comma separated. Aliases work (`agy`). |
+| `--offline` | No network: skip the public catalogs. |
+| `--state-dir <dir>` | Where to keep state (see below). |
+
+Plain text is printed by default. `updates` shows each CLI's version, how it
+was installed, and the command that would update it. agent-scout never runs
+that command itself.
+
+CLI ids: `claude`, `codex`, `opencode`, `antigravity` (alias `agy`),
+`opencode2`, `gemini`, `devin`, `grok`, `cursor`, `vibe`, `pi`, `omp`, `kimi`,
+`muse`, `antigravity-acp`.
