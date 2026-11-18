@@ -330,3 +330,200 @@ export function wrappedEngine(path) {
   return engine;
 }
 
+// --------------------------------------------------------------- public API
+
+const wanted = (ids) => {
+  if (!ids) return Object.keys(ENGINES);
+  const list = (Array.isArray(ids) ? ids : String(ids).split(',')).map((x) => String(x).trim()).filter(Boolean);
+  const out = [];
+  for (const name of list) {
+    const id = resolveCliId(name);
+    if (!id) throw new Error(`unknown CLI: ${name} (known: ${Object.keys(ENGINES).join(', ')})`);
+    if (!out.includes(id)) out.push(id);
+  }
+  return out;
+};
+
+/** The CLI ids `ids` names (comma list or array, aliases allowed), in table order. */
+export const selectClis = (ids) => {
+  const chosen = wanted(ids);
+  return Object.keys(ENGINES).filter((id) => chosen.includes(id));
+};
+
+/**
+ * Which coding-agent CLIs are on this machine.
+ *
+ * options
+ *   clis       ids to look for (array or "codex,claude"); default all
+ *   env        the environment to look in (default process.env)
+ *   path       a PATH to search instead of asking the shells (tests, sandboxes)
+ *   shell      false (or AGENT_SCOUT_NO_SHELL=1) skips the login and
+ *              interactive shells: only env.PATH is searched
+ *   version    false skips `--version`
+ *   homes      { [cliId]: home } to override each CLI's account home
+ *
+ * Every requested CLI is returned, installed or not.
+ */
+export async function findClis(options = {}) {
+  const env = options.env ?? process.env;
+  const ids = selectClis(options.clis);
+  const engines = ids.map((id) => ENGINES[id]);
+  const bins = engines.flatMap((e) => (e.managed || !e.bin ? [] : [e.bin, ...(e.altBins ?? [])]));
+
+  let found = new Map();
+  let far = new Map();
+  let termPath = '';
+  if (typeof options.path === 'string') {
+    for (const bin of bins) {
+      const hit = findBinary([bin], { PATH: options.path });
+      if (hit) found.set(bin, hit.path);
+      if (hit && !findBinary([bin], { PATH: env.PATH ?? '' })) far.set(bin, hit.path);
+    }
+    termPath = options.path;
+  } else if (options.shell === false || env.AGENT_SCOUT_NO_SHELL === '1') {
+    for (const bin of bins) {
+      const hit = findBinary([bin], { PATH: env.PATH ?? '' });
+      if (hit) found.set(bin, hit.path);
+    }
+  } else {
+    termPath = (await shellSymbols({ functions: false, env })).path;
+    ({ found, far } = await locate(bins, termPath, env));
+  }
+
+  const out = await Promise.all(engines.map(async (e) => {
+    const base = {
+      id: e.id,
+      label: e.label,
+      aliases: e.aliases ?? [],
+      bin: e.bin ?? null,
+      installed: false,
+      path: null,
+      realPath: null,
+      onPath: false,
+      version: null,
+      home: expand(cliHome(e.id, { homes: options.homes, env })),
+      managed: !!e.managed,
+    };
+    if (e.managed) {
+      // A managed CLI ships no PATH binary; it is "installed" when its
+      // unpacked runtime is in place (Antigravity's ACP agent).
+      const install = antigravityInstall({ ...options, env });
+      if (!install) return base;
+      return { ...base, installed: true, path: install.exe, realPath: install.exe, version: install.version };
+    }
+    let hit = null;
+    for (const bin of [e.bin, ...(e.altBins ?? [])]) {
+      const path = found.get(bin);
+      if (path) { hit = { bin, path }; break; }
+    }
+    if (!hit) return base;
+    let realPath = hit.path;
+    try { realPath = realpathSync(hit.path); } catch { /* keep the link path */ }
+    const version = options.version === false ? null : await readVersion(hit.path, { env }).catch(() => null);
+    return {
+      ...base, bin: hit.bin, installed: true, path: hit.path, realPath,
+      onPath: !far.has(hit.bin), version,
+    };
+  }));
+  // The terminal PATH is handy for callers that start these CLIs later.
+  Object.defineProperty(out, 'searchPath', { value: joinPaths(env.PATH, termPath), enumerable: false });
+  return out;
+}
+
+/**
+ * Accounts on this machine: each installed CLI's default home, sibling
+ * homes (`~/.codex-work` next to `~/.codex`), and the owner's shell aliases,
+ * functions and wrapper scripts that launch a CLI. Secret-looking variables
+ * are reported by name only (`secretEnv`), never by value.
+ */
+export async function findAccounts(options = {}) {
+  const env = options.env ?? process.env;
+  const shell = options.symbols ? { symbols: options.symbols, path: options.path ?? '' } : await shellSymbols({ env });
+  const clis = options.installedClis ?? await findClis({ ...options, version: false });
+  const installed = Object.fromEntries(clis.filter((c) => c.installed).map((c) => [c.id, c.path]));
+  const far = new Map(clis.filter((c) => c.installed && !c.onPath && c.bin).map((c) => [c.bin, c.path]));
+
+  const accounts = [];
+  const byKey = new Map();
+  const add = (a) => {
+    const key = [a.cmd, (a.args || []).join(' '), JSON.stringify(a.env || {}), (a.secretEnv || []).join(','), (a.unset || []).join(',')].join('|');
+    const existing = byKey.get(key);
+    if (!existing) { byKey.set(key, a); accounts.push(a); return; }
+    // Same invocation reached two ways. A name the user chose themselves is
+    // more meaningful than one we synthesised from a directory listing.
+    if (a.source === 'alias' && existing.source === 'detected') {
+      existing.id = a.id;
+      existing.label = a.label;
+      existing.source = 'alias';
+    } else if (a.source === 'alias' && existing.source === 'alias') {
+      // Preserve the names people use even when two aliases launch alike.
+      accounts.push(a);
+    }
+  };
+
+  for (const cli of clis) {
+    if (!cli.installed) continue;
+    const e = ENGINES[cli.id];
+    const cmd = cli.onPath ? cli.bin : collapse(cli.path);
+    add({ id: e.id, label: e.label, cli: e.id, cmd, args: [], env: {}, secretEnv: [], unset: [], source: 'detected' });
+    // Extra accounts, inferred from sibling home directories. Only a CLI
+    // with an env-isolated home can run a second account this way; without
+    // one there is no variable to point at the sibling directory.
+    for (const home of e.homeEnv && !e.managed ? altHomes(e) : []) {
+      const suffix = home.split('/').pop().split('-').slice(1).join('-');
+      add({
+        id: `${e.id}-${suffix}`, label: `${e.label} · ${suffix}`, cli: e.id, cmd, args: [],
+        env: { [e.homeEnv]: home }, secretEnv: [], unset: [], source: 'detected',
+      });
+    }
+  }
+
+  const aliases = await discoverAliasAccounts(shell.symbols, installed, { termPath: shell.path, far, env });
+  for (const a of aliases) add(a);
+  return accounts;
+}
+
+/** Accounts the owner's aliases and functions encode; secrets stay names only. */
+export async function discoverAliasAccounts(symbols, installed, { termPath = '', far = new Map(), env = process.env } = {}) {
+  const accounts = [];
+  const all = [...symbols.keys()].map((name) => [name, resolve(name, symbols)]).filter(([, resolved]) => resolved);
+  // Not a CLI itself: maybe a script that launches one. Every bare
+  // command name is looked up at once.
+  const { found: where } = await locate(all.map(([, resolved]) => resolved.argv[0])
+    .filter((cmd) => !engineForCommand(cmd) && !cmd.includes('/')), termPath, env);
+  for (const [name, resolved] of all) {
+    let engineId = engineForCommand(resolved.argv[0]);
+    let wraps = null;
+    if (!engineId) {
+      const path = resolved.argv[0].includes('/') ? expand(resolved.argv[0]) : where.get(resolved.argv[0]) ?? null;
+      engineId = path ? wrappedEngine(path) : null;
+      // Keep the script's full path: the caller's PATH may not reach it.
+      if (engineId) { wraps = engineId; resolved.argv[0] = collapse(path); }
+    }
+    if (!engineId || !installed[engineId]) continue;
+    if (far.has(resolved.argv[0])) resolved.argv[0] = collapse(far.get(resolved.argv[0]));
+
+    const vars = {};
+    const secretEnv = [];
+    for (const [k, v] of Object.entries(resolved.env)) {
+      if (looksSecret(k, v)) secretEnv.push(k);
+      else vars[k] = collapse(v.replace(/^\$HOME/, HOME));
+    }
+
+    accounts.push({
+      id: name,
+      label: name,
+      cli: engineId,
+      cmd: resolved.argv[0],
+      args: resolved.argv.slice(1),
+      env: vars,
+      secretEnv,
+      unset: resolved.unset || [],
+      source: 'alias',
+      // Launched through a script: anything that runs the CLI's own binary
+      // for this account (listing models) has to go through it too.
+      ...(wraps ? { wraps } : {}),
+    });
+  }
+  return accounts;
+}
