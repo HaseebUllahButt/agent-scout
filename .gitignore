@@ -1,0 +1,11 @@
+node_modules/
+# agent-scout state, if a state folder is pointed inside the repo
+.state/
+state/
+models-cache.json
+follow.json
+signin.json
+cli-latest.json
+*.tmp
+.DS_Store
+public-catalogs.json

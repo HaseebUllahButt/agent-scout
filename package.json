@@ -1,0 +1,40 @@
+{
+  "name": "agent-scout",
+  "version": "0.1.0",
+  "description": "Find coding-agent CLIs on a machine, list the models each can run, and follow new models as they are released. Extracted from Helm.",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "agent-scout": "bin/agent-scout.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "keywords": [
+    "coding-agent",
+    "cli",
+    "models",
+    "claude",
+    "codex",
+    "opencode",
+    "antigravity"
+  ],
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/HaseebUllahButt/agent-scout.git"
+  }
+}
