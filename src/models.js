@@ -1075,3 +1075,182 @@ export function setAsideSignedOut(list) {
   };
 }
 
+// ------------------------------------------------------------- other CLIs
+
+/**
+ * `grok models` prints a "Default model:" line then `- id` rows with `*` on
+ * the current default. The same answer sits in config.toml under [models].
+ */
+async function grokModels(root, environment = {}, bin = 'grok') {
+  let def = null;
+  let effort = null;
+  try {
+    const toml = readFileSync(join(root, 'config.toml'), 'utf8');
+    const section = /^\s*\[models\]([\s\S]*?)(?=^\s*\[|\s*$)/m.exec(toml)?.[1] ?? '';
+    def = /^\s*default\s*=\s*"([^"]+)"/m.exec(section)?.[1] ?? null;
+    effort = /^\s*default_reasoning_effort\s*=\s*"([^"]+)"/m.exec(section)?.[1] ?? null;
+  } catch { /* no config */ }
+  let models = [];
+  const labels = {};
+  try {
+    const { stdout } = await exec(bin, ['models'], {
+      timeout: 20_000,
+      env: { ...process.env, ...environment, GROK_HOME: root },
+    });
+    for (const line of stdout.split('\n')) {
+      const listed = /^\s*[*-]\s*(\S+)/.exec(line);
+      const namedDefault = /^\s*Default model:\s*(\S+)/.exec(line);
+      if (namedDefault) def ??= namedDefault[1];
+      if (listed) models.push(listed[1]);
+    }
+  } catch { /* `grok models` may still work unauthenticated; if not, empty */ }
+  models = [...new Set(models)];
+  if (def && !models.includes(def)) models.unshift(def);
+  return { default: def, models, labels, effort, efforts: ['low', 'medium', 'high'], images: false, source: 'grok models' };
+}
+
+/**
+ * `pi --list-models` prints a table of the models Pi can use right now:
+ * only providers it is logged in to (or has a working key for).
+ * Columns: provider, model, context, max-out, thinking, images.
+ */
+export function parsePiModelList(stdout) {
+  const rows = [];
+  let header = false;
+  for (const line of String(stdout ?? '').split('\n')) {
+    const cols = line.trim().split(/\s+/);
+    if (!header) { header = cols[0] === 'provider' && cols[1] === 'model'; continue; }
+    if (cols.length < 6) continue;
+    const [provider, id, , , thinking, images] = cols;
+    rows.push({ selector: `${provider}/${id}`, thinking: thinking === 'yes', images: images === 'yes' });
+  }
+  return rows;
+}
+
+/**
+ * Pi asks `pi --list-models` so the list shows only what the owner is
+ * logged in to; names and thinking levels come from Pi's catalogs on disk
+ * (<home>/models.json, models-store.json). omp answers `omp models --json`
+ * with the same rows plus an explicit per-model thinking ladder and input list.
+ */
+async function piModels(engine, root, environment = {}, bin = engine) {
+  let def = null;
+  let effort = null;
+  if (engine === 'omp') {
+    try {
+      const yml = readFileSync(join(root, 'config.yml'), 'utf8');
+      const role = /^\s*default:\s*(\S+)/m.exec(yml)?.[1];
+      if (role) {
+        // `provider/model:thinking` - the suffix is the effort, not the name.
+        const [selector, level] = role.split(':');
+        def = selector;
+        effort = level ?? null;
+      }
+    } catch { /* no config */ }
+    try {
+      const { stdout } = await exec(bin, ['models', '--json'], {
+        timeout: 20_000, maxBuffer: 8 << 20,
+        env: { ...process.env, ...environment },
+      });
+      const rows = JSON.parse(stdout)?.models ?? [];
+      const models = [], labels = {}, effortsByModel = {}, imagesByModel = {};
+      for (const m of rows) {
+        const sel = m?.selector ?? (m?.provider && m?.id ? `${m.provider}/${m.id}` : null);
+        if (!sel || models.includes(sel)) continue;
+        models.push(sel);
+        if (m.name) labels[sel] = m.name;
+        if (Array.isArray(m.thinking) && m.thinking.length) effortsByModel[sel] = m.thinking;
+        if (Array.isArray(m.input)) imagesByModel[sel] = m.input.includes('image');
+      }
+      if (def && !models.includes(def)) models.unshift(def);
+      return {
+        default: def, models, labels, effort,
+        efforts: [...new Set(Object.values(effortsByModel).flat())],
+        effortsByModel, images: Object.values(imagesByModel).some(Boolean), imagesByModel,
+        source: 'omp models --json',
+      };
+    } catch { /* fall through to the pi-style disk read */ }
+  } else {
+    try {
+      const cfg = JSON.parse(readFileSync(join(root, 'settings.json'), 'utf8'));
+      if (cfg.defaultModel) def = cfg.defaultProvider ? `${cfg.defaultProvider}/${cfg.defaultModel}` : cfg.defaultModel;
+    } catch { /* no settings */ }
+  }
+
+  // pi's models.json: providers.<name>.models[] - id, name, reasoning,
+  // input, thinkingLevelMap (the levels the model actually accepts).
+  const models = [], labels = {}, effortsByModel = {}, imagesByModel = {};
+  if (engine === 'pi') {
+    let listed = null;
+    try {
+      const { stdout } = await exec(bin, ['--list-models'], {
+        timeout: 20_000, maxBuffer: 8 << 20,
+        env: { ...process.env, PI_CODING_AGENT_DIR: root, ...environment },
+      });
+      listed = parsePiModelList(stdout);
+    } catch { /* older pi or no binary: fall back to the catalogs on disk */ }
+    if (listed) {
+      const known = {};
+      for (const file of [join(root, 'models.json'), join(root, 'models-store.json')]) {
+        let cat = null;
+        try { cat = JSON.parse(readFileSync(file, 'utf8')); } catch { continue; }
+        // models.json nests under providers; models-store.json does not.
+        for (const [provider, p] of Object.entries(cat?.providers ?? cat ?? {})) {
+          for (const m of p?.models ?? []) if (m?.id) known[`${provider}/${m.id}`] ??= m;
+        }
+      }
+      for (const row of listed) {
+        const sel = row.selector;
+        if (models.includes(sel)) continue;
+        models.push(sel);
+        const m = known[sel];
+        if (m?.name) labels[sel] = m.name;
+        const levels = m?.thinkingLevelMap && typeof m.thinkingLevelMap === 'object'
+          ? Object.keys(m.thinkingLevelMap)
+          : (row.thinking ? ['off', 'minimal', 'low', 'medium', 'high'] : null);
+        if (levels?.length) effortsByModel[sel] = levels;
+        imagesByModel[sel] = row.images;
+      }
+      // Pi's saved default may sit on a provider it is no longer logged in
+      // to; offering it would only fail. Logged out of everything, the empty
+      // list is the truth, not the catalog.
+      return {
+        default: models.includes(def) ? def : (models[0] ?? null), models, labels, effort,
+        efforts: [...new Set(Object.values(effortsByModel).flat())],
+        effortsByModel, images: Object.values(imagesByModel).some(Boolean), imagesByModel,
+        source: 'pi --list-models',
+      };
+    }
+  }
+  for (const file of [join(root, 'models.json'), join(root, 'models-store.json')]) {
+    let cat = null;
+    try { cat = JSON.parse(readFileSync(file, 'utf8')); } catch { continue; }
+    for (const [provider, p] of Object.entries(cat?.providers ?? {})) {
+      for (const m of p?.models ?? []) {
+        const sel = `${provider}/${m.id}`;
+        if (!m.id || models.includes(sel)) continue;
+        models.push(sel);
+        if (m.name) labels[sel] = m.name;
+        const levels = m.thinkingLevelMap && typeof m.thinkingLevelMap === 'object'
+          ? Object.keys(m.thinkingLevelMap)
+          : (m.reasoning ? ['off', 'minimal', 'low', 'medium', 'high'] : null);
+        if (levels?.length) effortsByModel[sel] = levels;
+        if (Array.isArray(m.input)) imagesByModel[sel] = m.input.includes('image');
+      }
+    }
+    if (models.length) break;
+  }
+  if (def && !models.includes(def)) models.unshift(def);
+  return {
+    default: def, models, labels, effort,
+    efforts: [...new Set(Object.values(effortsByModel).flat())],
+    effortsByModel, images: Object.values(imagesByModel).some(Boolean), imagesByModel,
+    source: `${engine} models.json`,
+  };
+}
+
+/**
+ * `cursor-agent models` lists the account's models as plain lines (the
+ * --format json shape is `[{"id","name",...}]`). Behind `agent login` - an
+ * unauthenticated box simply offers nothing until it signs in.
+ */
